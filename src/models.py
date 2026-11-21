@@ -1,54 +1,62 @@
 from __future__ import annotations
 
-import torch
-from torch import nn
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
 
 
-class MLPRegressor(nn.Module):
-    def __init__(self, lookback: int = 60):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(lookback, 128), nn.ReLU(), nn.Dropout(0.20),
-            nn.Linear(128, 64), nn.ReLU(), nn.Dropout(0.10),
-            nn.Linear(64, 1),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
-
-
-class LSTMRegressor(nn.Module):
-    def __init__(self, hidden_size: int = 64):
-        super().__init__()
-        self.lstm = nn.LSTM(input_size=1, hidden_size=hidden_size, batch_first=True)
-        self.head = nn.Sequential(nn.Dropout(0.20), nn.Linear(hidden_size, 32), nn.ReLU(), nn.Linear(32, 1))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        sequence, _ = self.lstm(x)
-        return self.head(sequence[:, -1, :])
+def build_mlp(lookback: int = 60) -> keras.Model:
+    model = keras.Sequential([
+        layers.Input(shape=(lookback,)),
+        layers.Dense(64, activation="relu", kernel_regularizer=keras.regularizers.l2(1e-4)),
+        layers.Dropout(0.2),
+        layers.Dense(32, activation="relu", kernel_regularizer=keras.regularizers.l2(1e-4)),
+        layers.Dropout(0.2),
+        layers.Dense(1),
+    ])
+    model.compile(optimizer=keras.optimizers.Adam(1e-3), loss="mse")
+    return model
 
 
-class MultiOutputLSTM(nn.Module):
-    def __init__(self, n_assets: int = 5, hidden_size: int = 96):
-        super().__init__()
-        self.lstm = nn.LSTM(input_size=n_assets, hidden_size=hidden_size, num_layers=2, batch_first=True, dropout=0.15)
-        self.head = nn.Sequential(nn.Linear(hidden_size, 64), nn.ReLU(), nn.Dropout(0.15), nn.Linear(64, n_assets))
+def build_cnn_gaf(lookback: int = 60) -> keras.Model:
+    model = keras.Sequential([
+        layers.Input(shape=(lookback, lookback, 2)),
+        layers.Conv2D(16, 3, activation="relu", padding="same"),
+        layers.MaxPooling2D(2),
+        layers.Conv2D(32, 3, activation="relu", padding="same"),
+        layers.MaxPooling2D(2),
+        layers.Conv2D(32, 3, activation="relu", padding="same"),
+        layers.GlobalAveragePooling2D(),
+        layers.Dense(32, activation="relu"),
+        layers.Dropout(0.3),
+        layers.Dense(1),
+    ])
+    model.compile(optimizer=keras.optimizers.Adam(1e-3), loss="mse")
+    return model
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        sequence, _ = self.lstm(x)
-        return self.head(sequence[:, -1, :])
+
+def build_lstm(lookback: int = 60, n_features: int = 1,
+               n_outputs: int = 1, units: int = 32) -> keras.Model:
+    model = keras.Sequential([
+        layers.Input(shape=(lookback, n_features)),
+        layers.LSTM(units, dropout=0.1),
+        layers.Dense(16 if n_outputs == 1 else 32, activation="relu"),
+        layers.Dropout(0.2),
+        layers.Dense(n_outputs),
+    ])
+    model.compile(optimizer=keras.optimizers.Adam(1e-3), loss="mse")
+    return model
 
 
-class CNNGAFRegressor(nn.Module):
-    def __init__(self, image_size: int = 60):
-        super().__init__()
-        self.features = nn.Sequential(
-            nn.Conv2d(1, 16, kernel_size=3, padding=1), nn.BatchNorm2d(16), nn.ReLU(), nn.MaxPool2d(2),
-            nn.Conv2d(16, 32, kernel_size=3, padding=1), nn.BatchNorm2d(32), nn.ReLU(), nn.MaxPool2d(2),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1), nn.ReLU(), nn.AdaptiveAvgPool2d((4, 4)),
-        )
-        self.head = nn.Sequential(nn.Flatten(), nn.Linear(64 * 4 * 4, 64), nn.ReLU(), nn.Dropout(0.20), nn.Linear(64, 1))
+def gaf_images(X: "np.ndarray") -> "np.ndarray":
+    """Convert (samples, time) to two-channel GASF/GADF images."""
+    import numpy as np
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.head(self.features(x))
+    lo = X.min(axis=1, keepdims=True)
+    hi = X.max(axis=1, keepdims=True)
+    span = np.where(hi - lo == 0, 1.0, hi - lo)
+    z = np.clip((2 * X - hi - lo) / span, -1.0, 1.0)
+    sin_phi = np.sqrt(np.maximum(1.0 - z ** 2, 0.0))
+    gasf = z[:, :, None] * z[:, None, :] - sin_phi[:, :, None] * sin_phi[:, None, :]
+    gadf = sin_phi[:, :, None] * z[:, None, :] - z[:, :, None] * sin_phi[:, None, :]
+    return np.stack([gasf, gadf], axis=-1).astype("float32")
