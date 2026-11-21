@@ -1,50 +1,133 @@
-# Financial Return Prediction Project
+# Deep Learning for Financial Return Prediction & Tactical Asset Allocation
 
-A project space for developing and evaluating machine-learning approaches to financial return prediction.
+A reproducible research project comparing neural-network approaches to **25-trading-day-ahead returns** for five exchange-traded funds (ETFs), then translating the forecasts into transparent portfolio-allocation experiments.
 
-## Project objective
+> **Implementation note:** The source code and experiment pipeline are now included in this repository. Model training and the final held-out evaluation must be run in the user's environment to generate empirical results. This README does not publish unverified performance figures.
 
-The intended focus is to investigate whether historical market information and engineered financial features can support useful return forecasts, and to evaluate those forecasts using realistic out-of-sample methods.
+## Research design
 
-A credible implementation should document:
+| Component | Specification |
+|---|---|
+| ETF universe | SPY, TLT, SHY, GLD and DBO |
+| Input window | Previous 60 trading days of daily returns |
+| Forecast horizon | 25 trading days ahead |
+| Prediction target | Forward cumulative simple return for each ETF |
+| Models | MLP, CNN with Gramian Angular Fields (CNN-GAF), single-output LSTM, multi-output LSTM |
+| Ensemble | Average forecasts across three fixed random seeds |
+| Validation | Chronological train / validation / test partitions with a 25-observation purge at each boundary |
+| Scaling | Feature and target scalers fitted on training observations only |
+| Portfolio experiments | Equal-weight benchmark, long-only top-three, long-short top-two versus bottom-two |
 
-- The assets, market data source, observation frequency, and study period.
-- The return definition and forecast horizon.
-- Feature engineering and missing-data treatment.
-- Chronological train, validation, and test splits.
-- Baseline models and any machine-learning or deep-learning models.
-- Out-of-sample metrics, benchmark comparisons, and limitations.
+The project uses Yahoo Finance adjusted daily prices via `yfinance`. The default download start date is 2015-01-01; the actual dates available depend on the data provider.
 
-## Current repository status
+## Why these models?
 
-**Implementation pending.** This repository currently contains this README and the MIT licence only. No dataset, notebook, source code, dependency file, or verified model results are published here yet.
+- **MLP:** learns nonlinear relationships from flattened 60-day return windows.
+- **CNN-GAF:** transforms each univariate return window into a Gramian Angular Summation Field image, then learns spatial patterns with a convolutional network.
+- **Single-output LSTM:** models sequential dependence separately for each ETF.
+- **Multi-output LSTM:** predicts all five ETF returns jointly, allowing the recurrent representation to learn shared cross-asset information.
 
-For that reason, no performance figures or model claims are presented. The project should not be treated as a completed or reproducible prediction system until the implementation and evaluation artefacts are added.
+Each single-output architecture is fitted independently for each ETF. Three seeded runs are averaged to reduce dependence on one initialisation. The multi-output LSTM is trained jointly on the five return targets.
 
-## Planned structure
+## Validation and leakage controls
 
-The following is the proposed structure, not a description of files currently in the repository:
+Financial time series are not randomly shuffled. The pipeline:
+
+1. Builds each feature window using only trailing observations available at its forecast date.
+2. Creates the target from the price 25 trading days after that date.
+3. Splits samples chronologically into training, validation and test partitions.
+4. Leaves a 25-sample purge between adjacent partitions so training targets do not extend into the next partition.
+5. Fits feature and target standardisation on training data only.
+6. Uses validation loss for early stopping.
+7. Keeps the final test partition out of model fitting and early stopping.
+
+The held-out test period is used once to calculate forecast metrics and strategy results after training.
+
+## Portfolio experiments
+
+At each test date, the strategy ranks ETFs using the model's predicted 25-day return:
+
+- **Equal weight:** holds all five ETFs equally.
+- **Long-only top three:** allocates equally to the three highest forecasts.
+- **Long-short 2×2:** allocates 50% to each of the two highest forecasts and -50% to each of the two lowest forecasts.
+
+Portfolio weights are formed at a forecast date's close and applied to the next available trading day's realised ETF returns. The strategy is therefore **daily rebalanced using 25-day forecast rankings**; it is not a 25-day buy-and-hold trade. Reported strategy returns are gross of transaction costs, financing, taxes and market impact. These assumptions should be considered when interpreting the results.
+
+## Repository structure
 
 ```text
 Financial-Return-Prediction-Project/
-├── data/                 # Documented data instructions; avoid committing licensed data
-├── notebooks/            # Exploration and model experiments
-├── src/                  # Reusable data and modelling code
-├── tests/                # Data and model validation tests
+├── src/
+│   ├── data.py          # Price download, windows, purged splits and scaling
+│   ├── models.py        # MLP, CNN-GAF, LSTM and multi-output LSTM
+│   ├── train.py         # Training, seeded ensembles and evaluation
+│   └── backtest.py      # Forecast-ranked portfolio strategies
+├── tests/
+│   └── test_pipeline.py
 ├── requirements.txt
+├── results/             # Generated locally; excluded from Git
 └── README.md
 ```
 
-## Evaluation principles
+## Run locally
 
-Financial time series require particular care:
+### 1. Clone the repository
 
-1. Use chronological or walk-forward validation; do not randomly shuffle time-dependent observations.
-2. Fit scalers, imputers, feature selectors, and other transformations on training data only.
-3. Compare predictions with simple baselines, such as zero return or historical mean return.
-4. Report both prediction metrics and, where relevant, portfolio-level results after transaction costs.
-5. Keep the final test period untouched until model selection is complete.
-6. State clearly whether results are based on real market data, synthetic data, or a combination.
+```bash
+git clone https://github.com/Hillaryirungu/Financial-Return-Prediction-Project.git
+cd Financial-Return-Prediction-Project
+```
+
+### 2. Create a virtual environment
+
+**macOS / Linux**
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+**Windows PowerShell**
+```powershell
+py -m venv .venv
+.venv\\Scripts\\Activate.ps1
+```
+
+### 3. Install dependencies
+
+```bash
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+PyTorch will use CUDA when a compatible GPU is available; otherwise, training runs on CPU. The CNN-GAF and recurrent models can take time to train on CPU.
+
+### 4. Run the tests
+
+```bash
+python -m pytest tests/ -v
+```
+
+### 5. Run the experiment
+
+```bash
+python -m src.train --start 2015-01-01 --epochs 100
+```
+
+Generated outputs are written to `results/`:
+
+- Per-model ETF return forecasts.
+- Held-out MAE, RMSE and directional accuracy.
+- Daily returns for each portfolio strategy and model.
+- Strategy-level annualised return, volatility, Sharpe ratio and maximum drawdown.
+- Run metadata describing the sample and experiment settings.
+
+## Interpretation and limitations
+
+- Forecast accuracy does not by itself establish that a strategy is investable or profitable.
+- The strategy is a research backtest and excludes transaction costs, slippage, short-borrow costs, taxes and liquidity constraints.
+- Yahoo Finance is a third-party data source; availability, corporate-action adjustments and historical data quality should be checked before relying on results.
+- Results may vary with data revisions, package versions, random seeds and training hardware.
+- This is an educational quantitative-finance project, not investment advice.
 
 ## Author
 
