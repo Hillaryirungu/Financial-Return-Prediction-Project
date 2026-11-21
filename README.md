@@ -1,67 +1,76 @@
 # Deep Learning for Financial Return Prediction & Tactical Asset Allocation
 
-A reproducible research project comparing neural-network approaches to **25-trading-day-ahead returns** for five exchange-traded funds (ETFs), then translating the forecasts into transparent portfolio-allocation experiments.
+A reproducible MScFE 642 research project comparing deep-learning models for forecasting **25-trading-day-ahead returns** across five ETFs, then evaluating forecast-ranked portfolio strategies.
 
-> **Implementation note:** The source code and experiment pipeline are now included in this repository. Model training and the final held-out evaluation must be run in the user's environment to generate empirical results. This README does not publish unverified performance figures.
+## Research question
 
-## Research design
+Do sequence and image-based neural networks provide useful information for ranking diversified ETF returns, and does a joint multi-output LSTM offer an advantage over separately trained single-output LSTMs?
 
-| Component | Specification |
+## Data and experimental design
+
+| Item | Specification |
 |---|---|
 | ETF universe | SPY, TLT, SHY, GLD and DBO |
-| Input window | Previous 60 trading days of daily returns |
-| Forecast horizon | 25 trading days ahead |
-| Prediction target | Forward cumulative simple return for each ETF |
-| Models | MLP, CNN with Gramian Angular Fields (CNN-GAF), single-output LSTM, multi-output LSTM |
-| Ensemble | Average forecasts across three fixed random seeds |
-| Validation | Chronological train / validation / test partitions with a 25-observation purge at each boundary |
-| Scaling | Feature and target scalers fitted on training observations only |
-| Portfolio experiments | Equal-weight benchmark, long-only top-three, long-short top-two versus bottom-two |
+| Market data | Daily auto-adjusted prices from Yahoo Finance |
+| Sample | 2007–2022 |
+| Input | Trailing 60 daily log returns per ETF |
+| Target | 25-day forward cumulative log return: `ln(P[t+25] / P[t])` |
+| Training | Through 31 December 2015 |
+| Validation | 2016–2017 |
+| Out-of-sample test | 2018–2022 |
+| Purging | Samples whose 25-day target crosses a period boundary are excluded |
+| Scaling | Each ETF's input and target scalers are estimated from its training observations only |
+| Random initialisations | Three-seed prediction ensemble |
+| Optimisation | Adam, learning rate 0.001, batch size 64, early stopping (patience 25, restore best weights), up to 300 epochs |
 
-The project uses Yahoo Finance adjusted daily prices via `yfinance`. The default download start date is 2015-01-01; the actual dates available depend on the data provider.
+The common price history is downloaded and aligned across all five ETFs. The first and last available dates may vary if the data provider revises or limits its history.
 
-## Why these models?
+## Models
 
-- **MLP:** learns nonlinear relationships from flattened 60-day return windows.
-- **CNN-GAF:** transforms each univariate return window into a Gramian Angular Summation Field image, then learns spatial patterns with a convolutional network.
-- **Single-output LSTM:** models sequential dependence separately for each ETF.
-- **Multi-output LSTM:** predicts all five ETF returns jointly, allowing the recurrent representation to learn shared cross-asset information.
+- **MLP:** one feed-forward network per ETF, using a flattened 60-day return window.
+- **CNN-GAF:** one CNN per ETF, using two-channel Gramian Angular Field images: the summation field (GASF) and difference field (GADF).
+- **Single-output LSTM:** one recurrent network per ETF, modelling its 60 daily returns in time order.
+- **Multi-output LSTM:** one joint recurrent network receiving all five ETF histories and predicting all five forward returns simultaneously.
 
-Each single-output architecture is fitted independently for each ETF. Three seeded runs are averaged to reduce dependence on one initialisation. The multi-output LSTM is trained jointly on the five return targets.
+The three single-output architectures are trained separately for each ETF. Each model family uses three seeded fits, with predictions averaged across the ensemble. The multi-output LSTM uses a 64-unit recurrent layer and a five-value output head.
 
-## Validation and leakage controls
+## Evaluation
 
-Financial time series are not randomly shuffled. The pipeline:
+The script reports in-sample and out-of-sample results by model and ETF:
 
-1. Builds each feature window using only trailing observations available at its forecast date.
-2. Creates the target from the price 25 trading days after that date.
-3. Splits samples chronologically into training, validation and test partitions.
-4. Leaves a 25-sample purge between adjacent partitions so training targets do not extend into the next partition.
-5. Fits feature and target standardisation on training data only.
-6. Uses validation loss for early stopping.
-7. Keeps the final test partition out of model fitting and early stopping.
+- RMSE and MAE in cumulative log-return units.
+- Out-of-sample R² relative to the training-sample mean forecast.
+- Pearson and Spearman information coefficients.
+- Directional hit rate and the share of positive realised targets.
 
-The held-out test period is used once to calculate forecast metrics and strategy results after training.
+Overlapping 25-day targets are dependent observations. The results should therefore be interpreted with care; the notebook research additionally examines non-overlapping observations and moving-block bootstrap uncertainty.
 
-## Portfolio experiments
+## Tactical asset-allocation backtest
 
-At each test date, the strategy ranks ETFs using the model's predicted 25-day return:
+The test-period strategy rebalances **every 25 trading days**. At each rebalance close, the model ranks the five ETFs by predicted 25-day return and holds the resulting portfolio until the next rebalance. Holdings drift with realised prices between rebalances.
 
-- **Equal weight:** holds all five ETFs equally.
-- **Long-only top three:** allocates equally to the three highest forecasts.
-- **Long-short 2×2:** allocates 50% to each of the two highest forecasts and -50% to each of the two lowest forecasts.
+| Strategy | Allocation rule |
+|---|---|
+| Multi-output LSTM — long-only top 3 | One-third in each of the three highest-ranked ETFs |
+| Multi-output LSTM — long-short 2/2 | +50% in each of the two highest-ranked ETFs; -50% in each of the two lowest-ranked |
+| Single-output LSTMs — long-only top 3 | Same top-three rule using the five independent LSTM forecasts |
+| Single-output LSTMs — long-short 2/2 | Same long-short rule using the five independent LSTM forecasts |
+| Equal-weight buy-and-hold | 20% in each ETF, held without rebalancing |
+| Equal-weight rebalanced | 20% in each ETF, reset every 25 trading days |
 
-Portfolio weights are formed at a forecast date's close and applied to the next available trading day's realised ETF returns. The strategy is therefore **daily rebalanced using 25-day forecast rankings**; it is not a 25-day buy-and-hold trade. Reported strategy returns are gross of transaction costs, financing, taxes and market impact. These assumptions should be considered when interpreting the results.
+The backtest reports total return, CAGR, annualised volatility, Sharpe ratio, maximum drawdown and Calmar ratio. A separate sensitivity applies **10 basis points per unit of one-way turnover** at each rebalance.
+
+All backtest results are historical and gross/net cost assumptions are stated explicitly. They are not a live trading strategy or investment recommendation.
 
 ## Repository structure
 
 ```text
 Financial-Return-Prediction-Project/
 ├── src/
-│   ├── data.py          # Price download, windows, purged splits and scaling
-│   ├── models.py        # MLP, CNN-GAF, LSTM and multi-output LSTM
-│   ├── train.py         # Training, seeded ensembles and evaluation
-│   └── backtest.py      # Forecast-ranked portfolio strategies
+│   ├── data.py          # ETF prices, windows, targets, purged splits and scaling
+│   ├── models.py        # MLP, two-channel CNN-GAF and LSTM architectures
+│   ├── train.py         # Three-seed training, evaluation and backtest orchestration
+│   └── backtest.py      # 25-day holdings-based strategy engine
 ├── tests/
 │   └── test_pipeline.py
 ├── requirements.txt
@@ -71,63 +80,66 @@ Financial-Return-Prediction-Project/
 
 ## Run locally
 
-### 1. Clone the repository
+### 1. Clone and install
 
 ```bash
 git clone https://github.com/Hillaryirungu/Financial-Return-Prediction-Project.git
 cd Financial-Return-Prediction-Project
+python -m venv .venv
 ```
-
-### 2. Create a virtual environment
 
 **macOS / Linux**
 ```bash
-python3 -m venv .venv
 source .venv/bin/activate
 ```
 
 **Windows PowerShell**
 ```powershell
-py -m venv .venv
 .venv\\Scripts\\Activate.ps1
 ```
 
-### 3. Install dependencies
+Install dependencies:
 
 ```bash
 python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-PyTorch will use CUDA when a compatible GPU is available; otherwise, training runs on CPU. The CNN-GAF and recurrent models can take time to train on CPU.
+TensorFlow uses a compatible GPU when available; otherwise, it runs on CPU. Training all model families for three seeds can take time.
 
-### 4. Run the tests
+### 2. Run the tests
 
 ```bash
 python -m pytest tests/ -v
 ```
 
-### 5. Run the experiment
+### 3. Run the full experiment
 
 ```bash
-python -m src.train --start 2015-01-01 --epochs 100
+python -m src.train --epochs 300 --output-dir results
 ```
 
-Generated outputs are written to `results/`:
+Use a smaller `--epochs` value for a quick smoke run. Such a run is not directly comparable with the full 300-epoch maximum experiment.
 
-- Per-model ETF return forecasts.
-- Held-out MAE, RMSE and directional accuracy.
-- Daily returns for each portfolio strategy and model.
-- Strategy-level annualised return, volatility, Sharpe ratio and maximum drawdown.
-- Run metadata describing the sample and experiment settings.
+## Generated outputs
 
-## Interpretation and limitations
+The script writes the following to `results/`:
 
-- Forecast accuracy does not by itself establish that a strategy is investable or profitable.
-- The strategy is a research backtest and excludes transaction costs, slippage, short-borrow costs, taxes and liquidity constraints.
-- Yahoo Finance is a third-party data source; availability, corporate-action adjustments and historical data quality should be checked before relying on results.
-- Results may vary with data revisions, package versions, random seeds and training hardware.
-- This is an educational quantitative-finance project, not investment advice.
+- Per-model, per-ETF train and test predictions.
+- Forecast evaluation metrics.
+- Portfolio equity curves and rebalance allocation history.
+- Gross and 10-basis-point cost-sensitivity performance summaries.
+- Run metadata, including dates, seeds and epochs completed.
+
+The repository does not hard-code model scores. The result tables are generated by running the experiment against the downloaded data.
+
+## Limitations and reproducibility
+
+- Yahoo Finance is a third-party data source. Keep a dated local copy of the downloaded adjusted-price panel when exact replication is required.
+- Neural-network results depend on data revisions, package versions, hardware and random initialisation.
+- A positive information coefficient or historical backtest does not establish future profitability.
+- The 10 bp sensitivity is a simplified turnover-cost assumption; it does not fully model market impact, borrow availability, financing, taxes or liquidity.
+- The long-short portfolio has both long and short exposure and may not be suitable for every investor.
 
 ## Author
 
