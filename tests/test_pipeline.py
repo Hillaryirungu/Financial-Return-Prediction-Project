@@ -11,7 +11,7 @@ def test_windows_and_forward_target():
     data = make_windows(prices, lookback=10, horizon=5)
     assert data.X.shape[1:] == (10, 1)
     assert len(data.X) == len(data.y) == len(data.dates)
-    assert np.isclose(data.y[0, 0], prices.iloc[14, 0] / prices.iloc[9, 0] - 1)
+    assert np.isclose(data.y[0, 0], prices.iloc[15, 0] / prices.iloc[10, 0] - 1)
 
 
 def test_purged_split_has_no_adjacent_boundary_overlap():
