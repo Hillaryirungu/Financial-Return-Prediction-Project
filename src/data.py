@@ -5,131 +5,103 @@ from typing import Sequence
 
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import StandardScaler
 
-DEFAULT_TICKERS = ["SPY", "TLT", "SHY", "GLD", "DBO"]
+TICKERS = ["SPY", "TLT", "SHY", "GLD", "DBO"]
+LOOKBACK = 60
+HORIZON = 25
+TRAIN_END = "2015-12-31"
+VAL_START = "2016-01-01"
+VAL_END = "2017-12-31"
+TEST_START = "2018-01-01"
+TEST_END = "2022-12-31"
 
 
-def download_prices(
-    tickers: Sequence[str] = DEFAULT_TICKERS,
-    start: str = "2015-01-01",
-    end: str | None = None,
-) -> pd.DataFrame:
-    """Download adjusted daily ETF prices through yfinance."""
+def download_prices(tickers: Sequence[str] = TICKERS, start: str = "2007-01-01",
+                    end: str = "2023-01-01") -> pd.DataFrame:
+    """Download auto-adjusted daily ETF prices and align the common calendar."""
     import yfinance as yf
 
-    raw = yf.download(
-        list(tickers), start=start, end=end, auto_adjust=True,
-        progress=False, group_by="column", threads=True,
-    )
+    raw = yf.download(list(tickers), start=start, end=end, auto_adjust=True,
+                      progress=False, group_by="column", threads=True)
     if raw.empty:
-        raise RuntimeError("No price data returned. Check tickers, dates and network.")
+        raise RuntimeError("Yahoo Finance returned no prices; check network and dates.")
     close = raw["Close"] if isinstance(raw.columns, pd.MultiIndex) else raw[["Close"]]
-    if not isinstance(close, pd.DataFrame):
-        close = close.to_frame()
-    if len(tickers) == 1 and close.shape[1] == 1:
-        close.columns = list(tickers)
-    close = close.reindex(columns=list(tickers)).sort_index().dropna(how="all")
-    close = close.ffill(limit=2).dropna()
+    close = close.reindex(columns=list(tickers)).sort_index().dropna()
     if close.empty or close.isna().any().any():
-        raise ValueError("Price data is incomplete after cleaning.")
+        raise ValueError("Could not form a complete common price panel for all ETFs.")
     return close.astype(float)
 
 
 @dataclass
 class Dataset:
+    prices: pd.DataFrame
+    returns: pd.DataFrame
+    dates: pd.DatetimeIndex
+    target_end: pd.DatetimeIndex
     X: np.ndarray
     y: np.ndarray
-    dates: pd.DatetimeIndex
-    daily_returns: pd.DataFrame
     tickers: list[str]
+    masks: dict[str, np.ndarray]
+    x_mean: np.ndarray
+    x_std: np.ndarray
+    y_mean: np.ndarray
+    y_std: np.ndarray
+
+    def Xs(self, split: str) -> np.ndarray:
+        x = self.X[self.masks[split]]
+        return ((x - self.x_mean[None, None, :]) / self.x_std[None, None, :]).astype("float32")
+
+    def ys(self, split: str) -> np.ndarray:
+        y = self.y[self.masks[split]]
+        return ((y - self.y_mean[None, :]) / self.y_std[None, :]).astype("float32")
+
+    def y_raw(self, split: str) -> np.ndarray:
+        return self.y[self.masks[split]]
+
+    def dates_of(self, split: str) -> pd.DatetimeIndex:
+        return self.dates[self.masks[split]]
 
 
-def make_windows(
-    prices: pd.DataFrame,
-    lookback: int = 60,
-    horizon: int = 25,
-) -> Dataset:
-    """Create trailing-return windows and forward cumulative-return targets."""
-    if lookback < 2 or horizon < 1:
-        raise ValueError("lookback must be >=2 and horizon must be >=1")
+def build_dataset(prices: pd.DataFrame, lookback: int = LOOKBACK,
+                  horizon: int = HORIZON) -> Dataset:
+    """Build 60-day log-return windows and 25-day forward cumulative log returns.
+
+    A sample is assigned to a period only if its full forward target ends within
+    that period. Samples whose target crosses a boundary are purged.
+    """
     prices = prices.sort_index().dropna()
-    returns = prices.pct_change().dropna()
-    values = returns.to_numpy(dtype=np.float32)
-    price_values = prices.loc[returns.index].to_numpy(dtype=np.float64)
-    X, y, dates = [], [], []
-    for end_idx in range(lookback - 1, len(returns) - horizon):
-        X.append(values[end_idx - lookback + 1 : end_idx + 1])
-        y.append(price_values[end_idx + horizon] / price_values[end_idx] - 1.0)
-        dates.append(returns.index[end_idx])
-    if not X:
-        raise ValueError("Not enough observations for the requested lookback and horizon.")
-    return Dataset(
-        X=np.asarray(X, dtype=np.float32),
-        y=np.asarray(y, dtype=np.float32),
-        dates=pd.DatetimeIndex(dates),
-        daily_returns=returns,
-        tickers=list(prices.columns),
-    )
+    returns = np.log(prices / prices.shift(1)).dropna()
+    tickers = list(prices.columns)
+    dates = returns.index[lookback - 1:]
+    windows = [np.lib.stride_tricks.sliding_window_view(returns[t].to_numpy(), lookback)
+               for t in tickers]
+    X = np.stack(windows, axis=-1).astype("float32")
 
+    forward = returns.rolling(horizon).sum().shift(-horizon)
+    y_frame = forward.reindex(dates)
+    end_dates = pd.Series(returns.index, index=returns.index).shift(-horizon).reindex(dates)
+    valid = y_frame.notna().all(axis=1).to_numpy() & end_dates.notna().to_numpy()
+    dates = dates[valid]
+    X = X[valid]
+    y = y_frame.to_numpy(dtype="float32")[valid]
+    target_end = pd.DatetimeIndex(end_dates.to_numpy()[valid])
 
-@dataclass
-class TimeSplit:
-    train: np.ndarray
-    validation: np.ndarray
-    test: np.ndarray
+    masks = {
+        "train": np.asarray(target_end <= pd.Timestamp(TRAIN_END)),
+        "validation": np.asarray((dates >= pd.Timestamp(VAL_START)) & (target_end <= pd.Timestamp(VAL_END))),
+        "test": np.asarray((dates >= pd.Timestamp(TEST_START)) & (target_end <= pd.Timestamp(TEST_END))),
+    }
+    if any(mask.sum() == 0 for mask in masks.values()):
+        raise ValueError("A chronological split is empty. Check data coverage and date boundaries.")
 
+    train_X = X[masks["train"]]
+    train_y = y[masks["train"]]
+    x_mean = train_X.reshape(-1, len(tickers)).mean(axis=0)
+    x_std = train_X.reshape(-1, len(tickers)).std(axis=0)
+    y_mean = train_y.mean(axis=0)
+    y_std = train_y.std(axis=0)
+    x_std = np.where(x_std == 0, 1.0, x_std)
+    y_std = np.where(y_std == 0, 1.0, y_std)
 
-def purged_chronological_split(
-    n_samples: int,
-    horizon: int = 25,
-    train_fraction: float = 0.70,
-    validation_fraction: float = 0.15,
-) -> TimeSplit:
-    """Chronological split with a horizon-sized gap to prevent target overlap."""
-    if n_samples <= 3 * horizon:
-        raise ValueError("Insufficient samples for the requested purged split.")
-    if not 0 < train_fraction < 1 or not 0 < validation_fraction < 1:
-        raise ValueError("Split fractions must be between zero and one.")
-    if train_fraction + validation_fraction >= 1:
-        raise ValueError("Train plus validation fractions must be below one.")
-    first = int(n_samples * train_fraction)
-    second = int(n_samples * (train_fraction + validation_fraction))
-    train = np.arange(0, first)
-    validation = np.arange(min(first + horizon, second), second)
-    test = np.arange(min(second + horizon, n_samples), n_samples)
-    if min(len(train), len(validation), len(test)) == 0:
-        raise ValueError("Purging left an empty split; provide more observations.")
-    return TimeSplit(train, validation, test)
-
-
-@dataclass
-class ScaledData:
-    X_train: np.ndarray
-    X_validation: np.ndarray
-    X_test: np.ndarray
-    y_train: np.ndarray
-    y_validation: np.ndarray
-    y_test: np.ndarray
-    feature_scaler: StandardScaler
-    target_scaler: StandardScaler
-
-
-def scale_splits(dataset: Dataset, split: TimeSplit) -> ScaledData:
-    """Fit both scalers on training observations only."""
-    Xtr, Xv, Xte = dataset.X[split.train], dataset.X[split.validation], dataset.X[split.test]
-    ytr, yv, yte = dataset.y[split.train], dataset.y[split.validation], dataset.y[split.test]
-    n_assets = Xtr.shape[-1]
-    feature_scaler = StandardScaler().fit(Xtr.reshape(-1, n_assets))
-    target_scaler = StandardScaler().fit(ytr)
-
-    def scale_x(x: np.ndarray) -> np.ndarray:
-        return feature_scaler.transform(x.reshape(-1, n_assets)).reshape(x.shape).astype(np.float32)
-
-    return ScaledData(
-        X_train=scale_x(Xtr), X_validation=scale_x(Xv), X_test=scale_x(Xte),
-        y_train=target_scaler.transform(ytr).astype(np.float32),
-        y_validation=target_scaler.transform(yv).astype(np.float32),
-        y_test=target_scaler.transform(yte).astype(np.float32),
-        feature_scaler=feature_scaler, target_scaler=target_scaler,
-    )
+    return Dataset(prices, returns, dates, target_end, X, y, tickers, masks,
+                   x_mean, x_std, y_mean, y_std)
