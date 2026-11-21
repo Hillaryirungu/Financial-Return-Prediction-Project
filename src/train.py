@@ -72,6 +72,7 @@ def run(output_dir="results", epochs=MAX_EPOCHS):
     predictions = {}
     metric_rows = []
     histories_summary = {}
+    single_lstm_models = {}
 
     # Three single-output architectures, each trained separately for each ETF.
     for family in ("MLP", "CNN-GAF", "LSTM"):
@@ -93,6 +94,8 @@ def run(output_dir="results", epochs=MAX_EPOCHS):
             models, histories = fit_seed_ensemble(
                 builder, model_X["train"], y_train, model_X["validation"], y_val, epochs=epochs
             )
+            if family == "LSTM":
+                single_lstm_models[ticker] = models
             histories_summary[f"{family}:{ticker}"] = [len(h["loss"]) for h in histories]
 
             for split in ("train", "test"):
@@ -134,9 +137,38 @@ def run(output_dir="results", epochs=MAX_EPOCHS):
         for split, frame in splits.items():
             frame.to_csv(output / f"predictions_{family.lower().replace(' ', '_').replace('-', '_')}_{split}.csv")
 
+    # Generate forecasts for every test-period trading date, including the final
+    # 25 sessions whose forward labels are unavailable but whose features are known.
+    # These dates are required to carry the holdings-based backtest through TEST_END.
+    backtest_dates = prices.loc[TEST_START:TEST_END].index
+    return_dates = data.returns.index[LOOKBACK - 1:]
+    X_bt = {}
+    for j, ticker in enumerate(data.tickers):
+        windows = np.lib.stride_tricks.sliding_window_view(
+            data.returns[ticker].to_numpy(), LOOKBACK
+        )
+        positions = return_dates.get_indexer(backtest_dates)
+        if (positions < 0).any():
+            raise ValueError("Backtest dates are missing from the trailing-return window index.")
+        raw_windows = windows[positions]
+        X_bt[ticker] = ((raw_windows - data.x_mean[j]) / data.x_std[j]).astype("float32")
+
+    X_bt_multi = np.stack([X_bt[t] for t in data.tickers], axis=-1)
+    multi_scaled = ensemble_predict(multi_models, X_bt_multi).reshape(-1, len(data.tickers))
+    multi_raw = multi_scaled * data.y_std[None, :] + data.y_mean[None, :]
+    multi_daily = pd.DataFrame(multi_raw, index=backtest_dates, columns=data.tickers)
+
+    single_daily = pd.DataFrame(index=backtest_dates, columns=data.tickers, dtype=float)
+    for j, ticker in enumerate(data.tickers):
+        scaled_pred = ensemble_predict(single_lstm_models[ticker], X_bt[ticker][..., None]).reshape(-1)
+        single_daily[ticker] = scaled_pred * data.y_std[j] + data.y_mean[j]
+
+    multi_daily.to_csv(output / "predictions_multi_output_lstm_all_test_dates.csv")
+    single_daily.to_csv(output / "predictions_single_lstm_all_test_dates.csv")
+
     # Out-of-sample holdings-based strategy comparison, rebalanced every 25 sessions.
-    multi_test = predictions["Multi-output LSTM"]["test"]
-    single_test = predictions["LSTM"]["test"]
+    multi_test = multi_daily
+    single_test = single_daily
     strategy_inputs = {
         "Multi-output, long top 3": (multi_test, long_top3, False),
         "Multi-output, long-short 2/2": (multi_test, long_short_2x2, False),
