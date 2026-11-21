@@ -6,154 +6,181 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import torch
-from pyts.image import GramianAngularField
-from torch import nn
-from torch.utils.data import DataLoader, TensorDataset
+import tensorflow as tf
+from tensorflow import keras
 
-from src.backtest import backtest_daily, performance_summary
-from src.data import DEFAULT_TICKERS, download_prices, make_windows, purged_chronological_split, scale_splits
-from src.models import CNNGAFRegressor, LSTMRegressor, MLPRegressor, MultiOutputLSTM
+from src.backtest import backtest, equal_weight, long_short_2x2, long_top3, performance_summary
+from src.data import HORIZON, LOOKBACK, TEST_END, TEST_START, TICKERS, build_dataset, download_prices
+from src.models import build_cnn_gaf, build_lstm, build_mlp, gaf_images
 
 
-def _fit(model, Xtr, ytr, Xv, yv, epochs=100, patience=12, batch_size=64, seed=42):
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
-    train_ds = TensorDataset(torch.tensor(Xtr, dtype=torch.float32), torch.tensor(ytr, dtype=torch.float32))
-    loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
-    xv = torch.tensor(Xv, dtype=torch.float32, device=device)
-    yv_t = torch.tensor(yv, dtype=torch.float32, device=device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
-    loss_fn = nn.MSELoss()
-    best_loss, best_state, wait = float("inf"), None, 0
-    for _ in range(epochs):
-        model.train()
-        for xb, yb in loader:
-            xb, yb = xb.to(device), yb.to(device)
-            optimizer.zero_grad()
-            loss = loss_fn(model(xb), yb)
-            loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-        model.eval()
-        with torch.no_grad():
-            val_loss = float(loss_fn(model(xv), yv_t).item())
-        if val_loss < best_loss - 1e-6:
-            best_loss, wait = val_loss, 0
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-        else:
-            wait += 1
-            if wait >= patience:
-                break
-    if best_state is not None:
-        model.load_state_dict(best_state)
-    model.eval()
-    with torch.no_grad():
-        return model(torch.tensor(Xv, dtype=torch.float32, device=device)).cpu().numpy(), model
+SEEDS = (0, 1, 2)
+MAX_EPOCHS = 300
+BATCH_SIZE = 64
+PATIENCE = 25
 
 
-def _gaf(X: np.ndarray) -> np.ndarray:
-    transformer = GramianAngularField(image_size=X.shape[1], method="summation")
-    return transformer.fit_transform(X).astype(np.float32)[:, None, :, :]
-
-
-def run(
-    start="2015-01-01",
-    output_dir="results",
-    lookback=60,
-    horizon=25,
-    epochs=100,
-    seeds=(42, 43, 44),
-):
-    out = Path(output_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    prices = download_prices(DEFAULT_TICKERS, start=start)
-    dataset = make_windows(prices, lookback=lookback, horizon=horizon)
-    split = purged_chronological_split(len(dataset.X), horizon=horizon)
-    scaled = scale_splits(dataset, split)
-    tickers = dataset.tickers
-    target_scaler = scaled.target_scaler
-
-    # Each single-output architecture is trained independently per ETF.
-    forecasts = {name: np.zeros((len(split.test), len(tickers))) for name in ("MLP", "LSTM", "CNN-GAF")}
-    Xtr_all, Xv_all, Xte_all = scaled.X_train, scaled.X_validation, scaled.X_test
-    for asset_idx, ticker in enumerate(tickers):
-        ytr, yv = scaled.y_train[:, asset_idx:asset_idx+1], scaled.y_validation[:, asset_idx:asset_idx+1]
-        Xtr = Xtr_all[:, :, asset_idx:asset_idx+1]
-        Xv = Xv_all[:, :, asset_idx:asset_idx+1]
-        Xte = Xte_all[:, :, asset_idx:asset_idx+1]
-        per_model = {"MLP": (Xtr[:, :, 0], Xv[:, :, 0], Xte[:, :, 0], lambda: MLPRegressor(lookback)),
-                     "LSTM": (Xtr, Xv, Xte, lambda: LSTMRegressor()),
-                     "CNN-GAF": (_gaf(Xtr[:, :, 0]), _gaf(Xv[:, :, 0]), _gaf(Xte[:, :, 0]), lambda: CNNGAFRegressor())}
-        for model_name, (a, b, c, factory) in per_model.items():
-            seed_preds = []
-            for seed in seeds:
-                # Validation predictions drive early stopping; the restored best
-                # model is then evaluated on the untouched test partition.
-                _, model = _fit(factory(), a, ytr, b, yv, epochs=epochs, seed=seed)
-                device = next(model.parameters()).device
-                model.eval()
-                with torch.no_grad():
-                    pred = model(torch.tensor(c, dtype=torch.float32, device=device)).cpu().numpy().reshape(-1)
-                seed_preds.append(pred)
-            forecasts[model_name][:, asset_idx] = np.mean(seed_preds, axis=0)
-
-    # One multi-output LSTM learns all five ETF targets jointly.
-    multi_seed_preds = []
+def fit_seed_ensemble(builder, X_train, y_train, X_val, y_val,
+                      seeds=SEEDS, epochs=MAX_EPOCHS):
+    """Fit one network per seed with validation early stopping."""
+    models, histories = [], []
     for seed in seeds:
-        _, model = _fit(MultiOutputLSTM(n_assets=len(tickers)), Xtr_all, scaled.y_train,
-                        Xv_all, scaled.y_validation, epochs=epochs, seed=seed)
-        device = next(model.parameters()).device
-        model.eval()
-        with torch.no_grad():
-            pred = model(torch.tensor(Xte_all, dtype=torch.float32, device=device)).cpu().numpy()
-        multi_seed_preds.append(pred)
-    forecasts["Multi-output LSTM"] = np.mean(multi_seed_preds, axis=0)
+        keras.backend.clear_session()
+        tf.keras.utils.set_random_seed(seed)
+        model = builder()
+        callback = keras.callbacks.EarlyStopping(
+            monitor="val_loss", patience=PATIENCE, restore_best_weights=True
+        )
+        history = model.fit(
+            X_train, y_train, validation_data=(X_val, y_val),
+            epochs=epochs, batch_size=BATCH_SIZE, callbacks=[callback],
+            verbose=0, shuffle=True,
+        )
+        models.append(model)
+        histories.append(history.history)
+    return models, histories
 
-    test_dates = dataset.dates[split.test]
-    pred_frames = {}
+
+def ensemble_predict(models, X):
+    return np.mean([model.predict(X, verbose=0).squeeze() for model in models], axis=0)
+
+
+def evaluate(y_true, y_pred, historical_mean):
+    from scipy import stats
+
+    error = y_true - y_pred
+    pearson = np.corrcoef(y_true, y_pred)[0, 1] if np.std(y_pred) > 0 else np.nan
+    spearman = stats.spearmanr(y_true, y_pred).statistic if np.std(y_pred) > 0 else np.nan
+    denominator = np.sum((y_true - historical_mean) ** 2)
+    return {
+        "RMSE": float(np.sqrt(np.mean(error ** 2))),
+        "MAE": float(np.mean(np.abs(error))),
+        "R2 vs train mean": float(1 - np.sum(error ** 2) / denominator) if denominator > 0 else np.nan,
+        "IC (Pearson)": float(pearson),
+        "IC (Spearman)": float(spearman),
+        "Hit rate": float(np.mean(np.sign(y_true) == np.sign(y_pred))),
+        "Share of positive targets": float(np.mean(y_true > 0)),
+    }
+
+
+def run(output_dir="results", epochs=MAX_EPOCHS):
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+
+    prices = download_prices(TICKERS)
+    data = build_dataset(prices, LOOKBACK, HORIZON)
+    predictions = {}
     metric_rows = []
-    actual = dataset.y[split.test]
-    for name, pred_scaled in forecasts.items():
-        pred = target_scaler.inverse_transform(pred_scaled)
-        frame = pd.DataFrame(pred, index=test_dates, columns=tickers)
-        pred_frames[name] = frame
-        metric_rows.append({
-            "Model": name,
-            "MAE": float(np.mean(np.abs(pred - actual))),
-            "RMSE": float(np.sqrt(np.mean((pred - actual) ** 2))),
-            "Directional accuracy": float(np.mean(np.sign(pred) == np.sign(actual))),
-        })
-        frame.to_csv(out / f"forecasts_{name.lower().replace(' ', '_').replace('-', '_')}.csv")
+    histories_summary = {}
 
-    metrics = pd.DataFrame(metric_rows).set_index("Model")
-    metrics.to_csv(out / "forecast_metrics.csv")
-    (out / "run_metadata.json").write_text(json.dumps({
-        "tickers": tickers, "lookback_days": lookback, "forecast_horizon_days": horizon,
-        "train_samples": len(split.train), "validation_samples": len(split.validation),
-        "test_samples": len(split.test), "seeds": list(seeds),
-        "note": "Forecast metrics use the purged chronological test set. Strategy results are gross of transaction costs."
-    }, indent=2))
+    # Three single-output architectures, each trained separately for each ETF.
+    for family in ("MLP", "CNN-GAF", "LSTM"):
+        predictions[family] = {}
+        for j, ticker in enumerate(data.tickers):
+            X = {split: data.Xs(split)[:, :, j] for split in ("train", "validation", "test")}
+            if family == "MLP":
+                builder = lambda: build_mlp(LOOKBACK)
+                model_X = X
+            elif family == "LSTM":
+                builder = lambda: build_lstm(LOOKBACK, n_features=1, n_outputs=1, units=32)
+                model_X = {k: v[..., None] for k, v in X.items()}
+            else:
+                builder = lambda: build_cnn_gaf(LOOKBACK)
+                model_X = {k: gaf_images(v) for k, v in X.items()}
 
-    # Backtest each model's forecasts separately against the same daily returns.
-    summaries = []
-    for name, frame in pred_frames.items():
-        daily = backtest_daily(frame, dataset.daily_returns)
-        daily.to_csv(out / f"backtest_{name.lower().replace(' ', '_').replace('-', '_')}.csv")
-        summary = performance_summary(daily)
-        summary.insert(0, "Model", name)
-        summaries.append(summary.reset_index(names="Strategy"))
-    pd.concat(summaries, ignore_index=True).to_csv(out / "strategy_metrics.csv", index=False)
-    print(metrics.round(4))
-    print(f"Saved forecasts and backtests to {out.resolve()}")
+            y_train = data.ys("train")[:, j]
+            y_val = data.ys("validation")[:, j]
+            models, histories = fit_seed_ensemble(
+                builder, model_X["train"], y_train, model_X["validation"], y_val, epochs=epochs
+            )
+            histories_summary[f"{family}:{ticker}"] = [len(h["loss"]) for h in histories]
+
+            for split in ("train", "test"):
+                scaled_pred = ensemble_predict(models, model_X[split]).reshape(-1)
+                pred = scaled_pred * data.y_std[j] + data.y_mean[j]
+                predictions[family].setdefault(split, pd.DataFrame(index=data.dates_of(split), columns=data.tickers))
+                predictions[family][split][ticker] = pred
+                metric_rows.append({
+                    "Model": family, "ETF": ticker,
+                    "Sample": "in-sample" if split == "train" else "out-of-sample",
+                    **evaluate(data.y_raw(split)[:, j], pred, data.y_mean[j]),
+                })
+
+    # Joint five-output LSTM: five return histories in, five forecasts out.
+    multi_builder = lambda: build_lstm(LOOKBACK, n_features=len(data.tickers),
+                                       n_outputs=len(data.tickers), units=64)
+    multi_models, multi_histories = fit_seed_ensemble(
+        multi_builder, data.Xs("train"), data.ys("train"),
+        data.Xs("validation"), data.ys("validation"), epochs=epochs,
+    )
+    histories_summary["Multi-output LSTM"] = [len(h["loss"]) for h in multi_histories]
+    predictions["Multi-output LSTM"] = {}
+    for split in ("train", "test"):
+        scaled = ensemble_predict(multi_models, data.Xs(split))
+        scaled = np.asarray(scaled).reshape(-1, len(data.tickers))
+        raw = scaled * data.y_std[None, :] + data.y_mean[None, :]
+        frame = pd.DataFrame(raw, index=data.dates_of(split), columns=data.tickers)
+        predictions["Multi-output LSTM"][split] = frame
+        for j, ticker in enumerate(data.tickers):
+            metric_rows.append({
+                "Model": "Multi-output LSTM", "ETF": ticker,
+                "Sample": "in-sample" if split == "train" else "out-of-sample",
+                **evaluate(data.y_raw(split)[:, j], raw[:, j], data.y_mean[j]),
+            })
+
+    metrics = pd.DataFrame(metric_rows)
+    metrics.to_csv(output / "forecast_metrics.csv", index=False)
+    for family, splits in predictions.items():
+        for split, frame in splits.items():
+            frame.to_csv(output / f"predictions_{family.lower().replace(' ', '_').replace('-', '_')}_{split}.csv")
+
+    # Out-of-sample holdings-based strategy comparison, rebalanced every 25 sessions.
+    multi_test = predictions["Multi-output LSTM"]["test"]
+    single_test = predictions["LSTM"]["test"]
+    strategy_inputs = {
+        "Multi-output, long top 3": (multi_test, long_top3, False),
+        "Multi-output, long-short 2/2": (multi_test, long_short_2x2, False),
+        "Single LSTMs, long top 3": (single_test, long_top3, False),
+        "Single LSTMs, long-short 2/2": (single_test, long_short_2x2, False),
+        "Equal weight, buy-and-hold": (multi_test, equal_weight, True),
+        "Equal weight, rebalanced 25d": (multi_test, equal_weight, False),
+    }
+    curves, allocations, net_rows = {}, {}, []
+    for name, (forecast, rule, buy_hold) in strategy_inputs.items():
+        curve, weights = backtest(prices, forecast, rule, HORIZON, cost_bps=0, buy_and_hold=buy_hold)
+        curves[name], allocations[name] = curve, weights
+        net_curve, _ = backtest(prices, forecast, rule, HORIZON, cost_bps=10, buy_and_hold=buy_hold)
+        gross_stats = performance_summary(curve)
+        net_stats = performance_summary(net_curve)
+        net_rows.append({"Strategy": name, **{f"Gross {k}": v for k, v in gross_stats.items()},
+                         **{f"Net of 10bp {k}": v for k, v in net_stats.items()}})
+    curve_frame = pd.DataFrame(curves)
+    curve_frame.to_csv(output / "backtest_equity_curves.csv")
+    pd.concat(allocations, names=["Strategy", "Rebalance date"]).to_csv(output / "allocation_history.csv")
+    pd.DataFrame(net_rows).to_csv(output / "backtest_metrics.csv", index=False)
+
+    metadata = {
+        "tickers": data.tickers, "lookback_trading_days": LOOKBACK,
+        "forecast_horizon_trading_days": HORIZON, "train_end": "2015-12-31",
+        "validation_period": ["2016-01-01", "2017-12-31"],
+        "test_period": [TEST_START, TEST_END], "seeds": list(SEEDS),
+        "epochs_max": epochs, "early_stopping_patience": PATIENCE,
+        "batch_size": BATCH_SIZE, "optimizer": "Adam(learning_rate=0.001)",
+        "target": "25-day forward cumulative log return",
+        "backtest_rebalance_frequency_days": HORIZON,
+        "transaction_cost_sensitivity_bps_per_unit_turnover": 10,
+        "training_epochs_by_model": histories_summary,
+        "note": "Metrics are generated by running this script; no unverified scores are hard-coded.",
+    }
+    (output / "run_metadata.json").write_text(json.dumps(metadata, indent=2))
+    print(metrics[metrics["Sample"] == "out-of-sample"].round(4).to_string(index=False))
+    print(pd.DataFrame(net_rows).round(3).to_string(index=False))
+    print(f"Saved outputs to {output.resolve()}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train ETF return forecasting models.")
-    parser.add_argument("--start", default="2015-01-01")
+    parser = argparse.ArgumentParser(description="Train the MScFE642 multi-ETF forecasting models.")
     parser.add_argument("--output-dir", default="results")
-    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--epochs", type=int, default=MAX_EPOCHS)
     args = parser.parse_args()
-    run(start=args.start, output_dir=args.output_dir, epochs=args.epochs)
+    run(output_dir=args.output_dir, epochs=args.epochs)
